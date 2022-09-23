@@ -9,6 +9,6 @@ services:
     env_file:
       - .dockerenv
     volumes:
-      - ${PWD}/claudine/server/settings.yaml:/home/app/cato/settings.yaml
+      - ./claudine/server/settings.yaml:/home/app/cato/settings.yaml
 
 
