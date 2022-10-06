@@ -6,28 +6,32 @@ import Paper from '@material-ui/core/Paper';
 import Card from '@material-ui/core/Card';
 import CardContent from '@material-ui/core/CardContent';
 import Grid from '@material-ui/core/Grid';
+import { BoxPlotController, BoxAndWiskers } from '@sgratzl/chartjs-chart-boxplot';
 
 import isEmpty from 'lodash/isEmpty';
 
 import {
   Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  Title,
-  Tooltip,
-  BarController,
-  BarElement,
-  // registerables // Use this if we want to register everything instead
+  // CategoryScale,
+  // LinearScale,
+  // Title,
+  // Tooltip,
+  // BarController,
+  // BarElement,
+  registerables // Use this if we want to register everything instead
 } from 'chart.js';
 
 // Only selects used modules so that library/webpack tree-shakes properly
 ChartJS.register(
-  BarElement,
-  CategoryScale,
-  BarController,
-  LinearScale,
-  Title,
-  Tooltip,
+  ...registerables,
+  BoxPlotController,
+  BoxAndWiskers
+  // BarElement,
+  // CategoryScale,
+  // BarController,
+  // LinearScale,
+  // Title,
+  // Tooltip,
 );
 
 function formatStatNumber(value, sigFigures) {
@@ -43,13 +47,15 @@ function formatStatNumber(value, sigFigures) {
     }
 
     return Number.isInteger(parsed) ? parsed : parsed.toFixed(sigFigures);
-  } catch(e) {
+  } catch (e) {
     console.error('Error formatting stat number, e:', e);
     return '-';
   }
 }
 
-function loadConfig(labels, datasets) {
+function loadConfig(labels, datasets, statistics) {
+
+  console.log('DATASETS: ', datasets.data, 'STATS: ', statistics);
 
   return {
     data: {
@@ -62,6 +68,32 @@ function loadConfig(labels, datasets) {
         barPercentage: 1,
         backgroundColor: '#66BB6A',
         borderRadius: 1,
+      }]
+    },
+
+    boxPlotData: {
+      labels,
+      datasets: [{
+        label: datasets.label,
+        data: [
+          {
+            min: statistics.min,
+            max: statistics.max,
+            q1: statistics['25%'],
+            q3: statistics['75%'],
+            median: statistics['50%'],
+            mean: statistics.mean,
+            items: [datasets.data],
+            outliers: [],
+          }], // array data itself
+        showLine: true,
+        minBarLength: 4,
+        barPercentage: 1,
+        backgroundColor: '#66BB6A',
+        borderRadius: 1,
+        outlierColor: '#99999', // BoxPlot options
+        padding: 0,
+        itemRadius: 0,
       }]
     },
 
@@ -145,7 +177,7 @@ function loadConfig(labels, datasets) {
           },
           // Yes Label:
           ticks: {
-            callback: function(val, index) {
+            callback: function (val, index) {
               const label = this.getLabelForValue(val);
               return formatStatNumber(label, 2);
             },
@@ -184,27 +216,42 @@ export default React.memo(withStyles((theme) => ({
   colorHint: {
     color: theme.palette.secondary.main
   }
-}))(({ classes, statistics={}, histogramData, ...props }) => {
+}))(({ classes, statistics = {}, histogramData, ...props }) => {
 
-  const { data=[], labels=[] } = histogramData;
+  const { data = [], labels = [] } = histogramData;
+  const statsPass = statistics;
   const canvasRef = React.useRef(null);
+  const boxCanvasRef = React.useRef(null);
   const chartRef = React.useRef();
-  const hasData = !isEmpty(data) && !isEmpty(labels);
+  const boxChartRef = React.useRef();
 
   const statKeys = Object.keys(statistics);
+  const hasData = !isEmpty(data) && !isEmpty(labels);
 
   const renderChart = () => {
     if (!canvasRef.current || !hasData) { return; }
 
     const ctx = canvasRef.current;
-    const config = loadConfig(labels, {data, label: 'Count'});
+    const config = loadConfig(labels, { data, label: 'Count' }, statsPass);
 
-    chartRef.current= new ChartJS(ctx, {
+    chartRef.current = new ChartJS(ctx, {
       type: 'bar',
       data: config.data,
       options: config.options,
     });
+  };
 
+  const renderBoxChart = () => {
+    if (!boxCanvasRef.current || !hasData) { return; }
+
+    const ctx = boxCanvasRef.current;
+    const config = loadConfig(labels, { data, label: 'Count' }, statsPass);
+
+    boxChartRef.current = new ChartJS(ctx, {
+      type: 'boxplot',
+      data: config.boxPlotData,
+      options: config.options,
+    });
   };
 
   const destroyChart = () => {
@@ -212,10 +259,15 @@ export default React.memo(withStyles((theme) => ({
       chartRef.current.destroy();
       chartRef.current = null;
     }
+    if (boxChartRef.current) {
+      boxChartRef.current.destroy();
+      boxChartRef.current = null;
+    }
   };
 
   React.useEffect(() => {
     renderChart();
+    renderBoxChart();
     return destroyChart;
   }, []);
 
@@ -225,10 +277,17 @@ export default React.memo(withStyles((theme) => ({
       <Paper
         elevation={1}
         className={classes.chartContainer}
-        style={{display: hasData ? 'block' : 'none'}}
+        style={{ display: hasData ? 'block' : 'none' }}
       >
         <canvas
           ref={canvasRef}
+          role='img'
+          {...props}
+        >
+          {'Loading...'}
+        </canvas>
+        <canvas
+          ref={boxCanvasRef}
           role='img'
           {...props}
         >
@@ -255,33 +314,33 @@ export default React.memo(withStyles((theme) => ({
         spacing={2}
       >
         {statKeys
-         .map(statName => (
-           <Grid
-             item
-             xs={6}
-             key={`${statName}-${statistics[statName]}`}
-           >
-             <Card>
-               <CardContent className={classes.cardContent}>
-                 <Typography
-                   gutterBottom
-                   color="textSecondary"
-                 >
-                   {statName}
-                 </Typography>
+          .map(statName => (
+            <Grid
+              item
+              xs={6}
+              key={`${statName}-${statistics[statName]}`}
+            >
+              <Card>
+                <CardContent className={classes.cardContent}>
+                  <Typography
+                    gutterBottom
+                    color="textSecondary"
+                  >
+                    {statName}
+                  </Typography>
 
-                 <Typography
-                   className={classes.cardTextValue}
-                   variant="h5"
-                   component="h5"
-                 >
-                   {formatStatNumber(statistics[statName], 4)}
-                 </Typography>
+                  <Typography
+                    className={classes.cardTextValue}
+                    variant="h5"
+                    component="h5"
+                  >
+                    {formatStatNumber(statistics[statName], 4)}
+                  </Typography>
 
-               </CardContent>
-             </Card>
-           </Grid>
-         ))}
+                </CardContent>
+              </Card>
+            </Grid>
+          ))}
 
       </Grid>
 
