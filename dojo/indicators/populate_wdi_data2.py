@@ -67,7 +67,7 @@ def populate_wdi_data(args):
             upload_files_to_s3(meta.get("id"),name, args)
 
             # update meta data_paths
-            meta['data_paths']=[f's3://{args.bucket}/datasets/wdi/{meta.get("id")}/{meta.get("id")}.parquet.gzip']
+            meta['data_paths']=[f's3://{args.bucket}/datasets/{meta.get("id")}/{meta.get("id")}.parquet.gzip']
 
             # # save meta data to elasticsearch
             save_meta_es(meta)
@@ -399,7 +399,7 @@ def indicator_groups():
 
     for name, group in groups.items():
 
-        if name == "WDI - health.SH.anemia":
+        if name == "WDI - social_migration":
             yield name, group
 
 def make_dataset(df, country_codes):
@@ -698,10 +698,10 @@ def save_meta_es(meta):
 
 
 def upload_files_to_s3(id, name, args):
-    for file_type in ['csv','parquet.gzip']:
-        with open(f'output/{name}.{file_type}',"rb") as f:
-            s3.upload_fileobj(f, f"{args.bucket}", f"wbi/{id}/{id}.{file_type}")
-
+    with open(f'output/{name}.parquet.gzip',"rb") as f:
+        s3.upload_fileobj(f, f"{args.bucket}", f"datasets/{id}/{id}.parquet.gzip")
+    with open(f'output/{name}.csv',"rb") as f:
+        s3.upload_fileobj(f, f"{args.bucket}", f"datasets/{id}/raw_data.csv")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
