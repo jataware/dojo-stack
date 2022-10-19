@@ -11,3 +11,4 @@ datamodel-code-generator==0.11.6
 elasticsearch==7.12.0
 pandas==1.2.4
 boto3==1.17.89
+tqdm==4.62.3
