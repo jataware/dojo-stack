@@ -6,14 +6,13 @@ import time
 from tqdm import tqdm
 from datetime import datetime, timezone
 from uuid import uuid4
-from urllib.parse import urlparse
-import boto3
 import pdb
 import pydantic
 import pandas as pd
 import json
 import argparse
 from elasticsearch import Elasticsearch
+import boto3
 
 def populate_wdi_data(args):
     try:
@@ -62,7 +61,7 @@ def populate_wdi_data(args):
                 json.dump(meta, f)
 
             # make parquet files
-            save_parquet(df, name, id=meta.get("id"))
+            save_parquet(df, name)
 
             # # upload csv and parquet to s3
             upload_files_to_s3(meta.get("id"),name, args)
@@ -456,19 +455,13 @@ def optimize_df_types(df: pd.DataFrame):
 
     return
 
-def save_parquet(df,name, id):
-    # DATASET_STORAGE_BASE_URL="s3://jataware-world-modelers-dev/datasets/wdi/"
+def save_parquet(df,name):
     filename=f'{name}.parquet.gzip'
-    # dest_path = os.path.join(DATASET_STORAGE_BASE_URL, id, filename)
-    # location_info = urlparse(dest_path)
-
     # optimize data types for storage
     optimize_df_types(df)
     # save a parquet file
     df.to_parquet(f"output/{filename}", compression="gzip")
 
-    # send to s3
-    # s3.put_object(Bucket=location_info.netloc, Key=output_path, Body=fileobj)
 
 
 def make_metadata(df, series_info, name, description):
@@ -702,7 +695,6 @@ def save_meta_es(meta):
     resp = es.index(index="indicators", body=meta, id=meta.get("id"))
     print(resp)
 
-import boto3
 
 
 def upload_files_to_s3(id, name, args):
