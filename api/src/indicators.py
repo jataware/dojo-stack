@@ -43,18 +43,56 @@ from validation.IndicatorSchema import (
     Output,
     Period,
     Geography,
+    FeaturesSearchSchema
 )
-
+from functools import reduce
 import os
+
+from rq import Queue
+from redis import Redis
+from rq.exceptions import NoSuchJobError
+from rq import job
+
+from src.datasearch.corpora import Corpus
+from src.search.bert_search import BertSentenceSearch
 
 router = APIRouter()
 
 es = Elasticsearch([settings.ELASTICSEARCH_URL], port=settings.ELASTICSEARCH_PORT)
 
+# REDIS CONNECTION AND QUEUE OBJECTS
+redis = Redis(
+    os.environ.get("REDIS_HOST", "redis.dojo-stack"),
+    os.environ.get("REDIS_PORT", "6379"),
+)
+q = Queue(connection=redis, default_timeout=-1)
 
 # For created_at times in epoch milliseconds
 def current_milli_time():
     return round(time.time() * 1000)
+
+# Initialize LLM Semantic Search Engine. Requires a corpus on instantiation
+# for now. We'll refactor the embedder engine once out of PoC stage.
+corpus = Corpus.from_list(["a"])
+engine = BertSentenceSearch(corpus, cuda=False)
+
+
+def enqueue_indicator_feature(indicator_id, indicator_dict):
+    """
+    Adds indiciator to queue to process by embeddings_process, which
+    at this time creates and attaches LLM embeddings to its features (outputs)
+    """
+    job_string = "embeddings_processors.calculate_store_embeddings"
+    job_id = f"{indicator_id}_{job_string}"
+
+    context = {
+        "indicator_id": indicator_id,
+        "full_indicator": indicator_dict
+    }
+
+    job = q.enqueue_call(
+        func=job_string, args=[context], kwargs={}, job_id=job_id
+    )
 
 
 @router.post("/indicators")
@@ -69,14 +107,15 @@ def create_indicator(payload: IndicatorSchema.IndicatorMetadataSchema):
     es.index(index="indicators", body=body, id=indicator_id)
     plugin_action("post_create", data=body, type="indicator")
 
-
     empty_annotations_payload = MetadataSchema.MetaModel(metadata={}).json()
     # (?): SHOULD WE HAVE PLUGINS AROUND THE ANNOTATION CREATION?
     plugin_action("before_create", data=body, type="annotation")
     es.index(index="annotations", body=empty_annotations_payload, id=indicator_id)
     plugin_action("post_create", data=body, type="annotation")
 
- 
+    # Saves all outputs, as features in a new index, with LLM embeddings
+    if payload.outputs:
+        enqueue_indicator_feature(indicator_id, json.loads(payload.json()))
 
     return Response(
         status_code=status.HTTP_201_CREATED,
@@ -98,6 +137,9 @@ def update_indicator(payload: IndicatorSchema.IndicatorMetadataSchema):
     es.index(index="indicators", body=body, id=indicator_id)
     plugin_action("post_update", data=body, type="indicator")
 
+    if payload.outputs:
+        enqueue_indicator_feature(indicator_id, json.loads(payload.json()))
+
     return Response(
         status_code=status.HTTP_200_OK,
         headers={"location": f"/api/indicators/{indicator_id}"},
@@ -112,12 +154,160 @@ def patch_indicator(
     payload.created_at = current_milli_time()
     body = json.loads(payload.json(exclude_unset=True))
     es.update(index="indicators", body={"doc": body}, id=indicator_id)
+
+    if payload.outputs:
+        enqueue_indicator_feature(indicator_id, json.loads(payload.json()))
+
     return Response(
         status_code=status.HTTP_200_OK,
         headers={"location": f"/api/indicators/{indicator_id}"},
         content=f"Updated indicator with id = {indicator_id}",
     )
 
+# TODO if we reuse the search schema response model, we need to allow extra for
+# semantic search max_score and other properties
+@router.get(
+"/features/search" # , response_model=IndicatorSchema.FeaturesSearchSchema
+)
+def semantic_search_features(query: str, scroll_id: Optional[str]=None):
+    """
+    Given a text query, uses semantic search engine to search for features that
+    match the query semantically. Query is a sentence that can be interpreted to
+    be related to a concept, such as:
+    'number of people who have been vaccinated'
+    """
+
+    size = 200
+
+    query_embedding = engine.embed_query(query)
+
+    features_query = {
+        "query": {
+            "script_score": {
+                "query": {"match_all": {}},
+                "script": {
+                    "source": "Math.max(cosineSimilarity(params.query_vector, 'embeddings'), 0)",
+                    "params": {
+                        "query_vector": query_embedding.tolist()
+                    }
+                }
+            }
+        },
+        "_source": {
+            "excludes": ["embeddings"]
+        }
+    }
+
+    results = es.search(index="features", body=features_query, scroll="2m", size=size)
+
+    if len(results["hits"]["hits"]) < size:
+        scroll_id = None
+    else:
+        scroll_id = results.get("_scroll_id", None)
+
+    max_score = results["hits"]["max_score"]
+
+    def formatOneResult(r):
+        r["_source"]["_score"] = r["_score"]
+        return r["_source"]
+
+    return {
+        "hits": results["hits"]["total"]["value"],
+        "items_in_page": len(results["hits"]["hits"]),
+        "scroll_id": scroll_id,
+        "max_score": max_score,
+        "results": [formatOneResult(i) for i in results["hits"]["hits"]],
+    }
+
+
+def outputs_as_features(acc, currentResult):
+    """Used to reduce the complete `indicators.outputs` properties and
+    format as features for client"""
+    datasetInfo = currentResult["_source"]
+    c = map(lambda output: {"owner_dataset": datasetInfo, **output["_source"]},
+            currentResult["inner_hits"]["outputs"]["hits"]["hits"])
+    result = acc + list(c)
+
+    return result
+
+
+@router.get(
+    "/features", response_model=IndicatorSchema.FeaturesSearchSchema
+)
+def search_features(term: Optional[str]=None, scroll_id: Optional[str]=None):
+    """
+    Return all features, or results from searching through them, if a search
+    term is provided. Will match `term` with wildcard to feature `name`,
+    `display_name`, or `description`.
+    """
+    if term:
+        wildcardTerm = f"*{term}*"
+
+        q = {
+            "query": {
+                "nested": {
+                    "path": "outputs",
+                    "query": {
+                        "bool": {
+                            "should": [
+                                { "wildcard": { "outputs.name": wildcardTerm }},
+                                { "wildcard": { "outputs.display_name": wildcardTerm }},
+                                { "wildcard": { "outputs.description": wildcardTerm }}
+                            ]
+                        }
+                    },
+                    "inner_hits": {
+                    }
+                }
+            },
+            "_source": [
+                "id",
+                "name"
+            ]
+        }
+    else:
+        q = {
+            "query": {
+                "nested": {
+                    "path": "outputs",
+                    "query": {
+                        "match_all": {}
+                    },
+                    "inner_hits": {}
+                }
+            },
+            "_source": [
+                "id",
+                "name"
+            ]
+        }
+
+    if not scroll_id:
+        # we need to kick off the query
+        results = es.search(index="indicators", body=q, scroll="2m", size=10)
+    else:
+        # otherwise, we can use the scroll
+        results = es.scroll(scroll_id=scroll_id, scroll="2m")
+
+    # These are document hits (es parent indicators) in current page
+    # The final response items_in_page property will group features within
+    # these indicators (will be more than indicator count)
+    totalIndicatorHitsInPage = len(results["hits"]["hits"])
+
+    # if results are less than the page size (10) don't return a scroll_id
+    if totalIndicatorHitsInPage < 10:
+        scroll_id = None
+    else:
+        scroll_id = results.get("_scroll_id", None)
+
+    # Groups features as array list from `results`, into `response`
+    response = reduce(outputs_as_features, results["hits"]["hits"], [])
+
+    return {
+        "items_in_page": len(response),
+        "scroll_id": scroll_id,
+        "results": response # array of features
+    }
 
 @router.get(
     "/indicators/latest", response_model=List[IndicatorSchema.IndicatorsSearchSchema]
@@ -334,7 +524,6 @@ def put_annotation(payload: MetadataSchema.MetaModel, indicator_id: str):
             content=f"Could not create annotation with id = {indicator_id}",
         )
 
-
 @router.patch("/indicators/{indicator_id}/annotations")
 def patch_annotation(payload: MetadataSchema.MetaModel, indicator_id: str):
     """Patch annotation for a dataset to Elasticsearch.
@@ -363,6 +552,7 @@ def patch_annotation(payload: MetadataSchema.MetaModel, indicator_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content=f"Could not update annotation with id = {indicator_id}",
         )
+
 
 
 @router.post("/indicators/{indicator_id}/upload")
